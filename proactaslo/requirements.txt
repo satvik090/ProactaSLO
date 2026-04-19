@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+asyncio
+confluent-kafka
+redis
+asyncpg
+sqlalchemy
+torch
+prophet
+river
+prometheus-client
+httpx
+grafana
+pydantic-settings
+python-dotenv
+apscheduler
+aiohttp
