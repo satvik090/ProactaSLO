@@ -48,25 +48,11 @@ Prometheus shows one time series per service for `slo_prediction_score`. In the 
 
 Grafana Explore reads the same `slo_prediction_score` series from Prometheus, proving the observability chain from FastAPI to Prometheus to Grafana.
 
-## Architecture
+## Architecture Diagram
 
-```mermaid
-flowchart LR
-    Synthetic["Synthetic service mesh<br/>15 services, 8 metrics each"] --> Prometheus["Prometheus<br/>scrape interval: 15s"]
-    Prometheus --> Ingestion["Async ingestion workers<br/>service + dependency vectors"]
-    Ingestion --> Redis["Redis ring buffers<br/>120 vectors per service"]
-    Redis --> ML["PyTorch LSTM predictor<br/>30 x 8 input window"]
-    API["FastAPI API<br/>SLO CRUD + predict + metrics"] --> Postgres["PostgreSQL<br/>SLO registry + prediction logs"]
-    API --> ML
-    ML --> Kafka["Kafka<br/>model-feedback, audit-log, violation-alerts"]
-    Kafka --> Feedback["Feedback consumer<br/>15 minute outcome check"]
-    Feedback --> Postgres
-    Postgres --> Retrainer["Nightly retrainer<br/>02:00 UTC, 7 day labels"]
-    Retrainer --> ML
-    API --> Metrics["Prometheus exposition<br/>/metrics"]
-    Metrics --> Prometheus
-    Prometheus --> Grafana["Grafana dashboard<br/>risk, drift, drops, accuracy"]
-```
+![ProactaSLO Architecture](proactaslo_architecture.svg)
+
+The architecture follows a metrics-first pipeline: synthetic or real service telemetry is scraped by Prometheus, normalized and buffered in Redis, scored by an LSTM-based prediction layer, logged in PostgreSQL, published through Kafka, and visualized through Prometheus and Grafana.
 
 ## System Layers
 
@@ -78,9 +64,9 @@ flowchart LR
 | Cache layer | Stores recent normalized vectors, prediction TTLs, and scaler state | Redis lists and keys |
 | ML layer | Predicts probability of future SLO violation | PyTorch LSTM |
 | Alerting layer | Publishes prediction, audit, and violation events | Kafka topics |
-| Feedback layer | Labels predictions after a 15 minute observation window | Kafka consumer + Prometheus query_range |
+| Feedback layer | Labels predictions after a 15 minute observation window | Kafka consumer plus Prometheus `query_range` |
 | Retraining layer | Rebuilds models from labelled prediction history | APScheduler at `02:00 UTC` |
-| Observability layer | Tracks prediction scores, drops, drift, lead time, and accuracy | Prometheus + Grafana |
+| Observability layer | Tracks prediction scores, drops, drift, lead time, and accuracy | Prometheus plus Grafana |
 
 ## Numeric Design Choices
 
@@ -123,203 +109,4 @@ LSTM layers:   2
 Hidden size:   64
 Dropout:       0.2
 Output:        sigmoid probability in [0, 1]
-```
 
-The model reads the last 30 normalized metric vectors for a service and returns a violation probability. The fresh demo run intentionally returns `0.5` when no checkpoint exists in `models/`. That keeps the system safe and observable before retraining data is available.
-
-## Architecture Tradeoffs
-
-| Choice | Benefit | Tradeoff |
-| --- | --- | --- |
-| Redis ring buffers for metric vectors | Fast reads for inference and simple bounded memory | Recent history is optimized for hot-path inference, not long-term analytics |
-| PostgreSQL for SLOs and prediction logs | Durable source of truth for policies and feedback labels | Slower than Redis, so it is not used for every metric sample |
-| Kafka for prediction feedback and alerts | Decouples API latency from downstream consumers | Adds operational complexity with broker and topic management |
-| Prometheus query API for ingestion | Reuses standard observability data instead of custom collectors | Ingestion depends on Prometheus availability and scrape freshness |
-| LSTM over rule-only thresholds | Captures temporal patterns and leading indicators | Requires labelled feedback and model checkpoints to outperform neutral fallback |
-| 30 second prediction TTL | Reduces duplicate inference during dashboard refreshes | Very short-lived spikes may be cached for up to 30 seconds |
-| 15 minute outcome window | Matches practical SLO alert validation windows | Feedback labels are delayed by design |
-
-## Local Run
-
-Start the full stack:
-
-```powershell
-docker compose up --build -d
-```
-
-Check containers:
-
-```powershell
-docker compose ps
-```
-
-Stop the stack:
-
-```powershell
-docker compose down
-```
-
-## Local URLs
-
-| Tool | URL | Purpose |
-| --- | --- | --- |
-| FastAPI Swagger | `http://localhost:8000/docs` | Test SLO and prediction APIs |
-| FastAPI metrics | `http://localhost:8000/metrics` | Prometheus exposition format |
-| Prometheus | `http://localhost:9090` | Query and inspect scraped metrics |
-| Grafana | `http://localhost:3000` | Visualize prediction metrics |
-
-Grafana credentials:
-
-```text
-admin / admin
-```
-
-## Demo API Calls
-
-Create an SLO:
-
-```json
-{
-  "service_name": "auth",
-  "metric": "p99_latency",
-  "threshold": 200.0,
-  "window_minutes": 15,
-  "budget_total": 43200.0,
-  "budget_consumed": 35000.0,
-  "alert_threshold_override": 0.6
-}
-```
-
-Fetch the SLO:
-
-```text
-GET /slos/auth
-```
-
-Run a prediction:
-
-```text
-GET /predict/auth
-```
-
-Fresh demo response:
-
-```json
-{
-  "service_name": "auth",
-  "score": 0.5,
-  "threshold": 0.6,
-  "alert_fired": false
-}
-```
-
-## Prometheus Queries
-
-Useful queries for validation:
-
-```promql
-slo_prediction_score
-```
-
-```promql
-ingestion_drop_total
-```
-
-```promql
-model_drift_signal
-```
-
-```promql
-prediction_accuracy
-```
-
-```promql
-slo_alert_fired_total
-```
-
-## Synthetic Mesh
-
-The synthetic mesh can simulate 15 microservices on ports `8001-8015`:
-
-| Service | Port |
-| --- | ---: |
-| auth | 8001 |
-| payment | 8002 |
-| order | 8003 |
-| inventory | 8004 |
-| shipping | 8005 |
-| notification | 8006 |
-| user | 8007 |
-| cart | 8008 |
-| search | 8009 |
-| recommendation | 8010 |
-| review | 8011 |
-| warehouse | 8012 |
-| gateway | 8013 |
-| scheduler | 8014 |
-| audit | 8015 |
-
-Run locally:
-
-```powershell
-python scripts\synthetic_mesh.py
-```
-
-Each service exposes Prometheus text metrics at:
-
-```text
-http://localhost:<port>/metrics
-```
-
-Violation injection behavior:
-
-| Event | Value |
-| --- | ---: |
-| Injection interval | random `7200-14400 seconds` |
-| Violation duration | random `600-1200 seconds` |
-| Normal p99 latency | mean `200 ms`, std `20 ms` |
-| Violation p99 latency | mean `600 ms`, std `50 ms` |
-| Gateway cascade p99 latency | mean `400 ms`, std `40 ms` for auth, payment, and order |
-| Normal error rate | mean `0.001`, std `0.0002` |
-| Violation error rate | mean `0.05`, std `0.005` |
-
-## Repository Structure
-
-```text
-proactaslo/
-├── docker-compose.yml
-├── prometheus.yml
-├── requirements.txt
-├── .env.example
-├── app/
-│   ├── main.py
-│   ├── config.py
-│   ├── slo_registry.py
-│   ├── metric_ingestion.py
-│   ├── prediction_engine.py
-│   ├── alert_publisher.py
-│   ├── feedback_consumer.py
-│   ├── retrainer.py
-│   ├── cache.py
-│   └── observability.py
-├── models/
-├── grafana/
-│   └── dashboard.json
-├── scripts/
-│   └── synthetic_mesh.py
-└── docs/
-    └── screenshots/
-```
-
-## What the Current Demo Proves
-
-The captured run proves:
-
-- The full Docker stack builds and starts.
-- SLOs can be created and retrieved through the API.
-- Predictions can be requested for a service.
-- Prediction scores are exported through `/metrics`.
-- Prometheus scrapes `slo_prediction_score`.
-- Grafana can query the same Prometheus-backed metric.
-
-The current screenshot set intentionally shows the neutral no-checkpoint path. In a production or extended demo run, labelled feedback rows and nightly retraining create `models/{service}.pt` checkpoints, after which the prediction score becomes model-driven rather than neutral.
